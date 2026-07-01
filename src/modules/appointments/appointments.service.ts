@@ -1,0 +1,327 @@
+import {
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, MoreThanOrEqual, Repository } from 'typeorm';
+import { DoctorSlot } from './entities/doctor-slot.entity';
+import { Appointment } from './entities/appointment.entity';
+import { Doctor } from '../doctors/entities/doctor.entity';
+import { Patient } from '../patients/entities/patient.entity';
+import { DoctorsService } from '../doctors/doctors.service';
+import { PatientsService } from '../patients/patients.service';
+import { SlotStatus } from '../../common/enums/slot-status.enum';
+import { AppointmentStatus } from '../../common/enums/appointment-status.enum';
+import { UserRoleName } from '../../common/enums/role.enum';
+import { CreateAppointmentDto } from './dto/create-appointment.dto';
+
+const WORK_START_HOUR = 8;
+const WORK_END_HOUR = 17;
+const DEFAULT_GENERATION_DAYS = 14;
+
+@Injectable()
+export class AppointmentsService {
+  constructor(
+    @InjectRepository(DoctorSlot)
+    private readonly doctorSlotRepository: Repository<DoctorSlot>,
+    @InjectRepository(Appointment)
+    private readonly appointmentRepository: Repository<Appointment>,
+    @InjectDataSource()
+    private readonly dataSource: DataSource,
+    private readonly doctorsService: DoctorsService,
+    private readonly patientsService: PatientsService,
+  ) {}
+
+  async generateSlotsForDoctor(
+    doctorUserId: string,
+    doctorId: string,
+    startDate: string,
+    days?: number,
+  ): Promise<DoctorSlot[]> {
+    const doctor = await this.doctorsService.findOne(doctorId);
+
+    if (doctor.userId !== doctorUserId) {
+      throw new ForbiddenException(
+        'No puede generar horarios para otro médico',
+      );
+    }
+
+    const totalDays = days ?? DEFAULT_GENERATION_DAYS;
+    const start = new Date(`${startDate}T00:00:00`);
+    const createdSlots: DoctorSlot[] = [];
+
+    for (let dayOffset = 0; dayOffset < totalDays; dayOffset++) {
+      const currentDate = new Date(start);
+      currentDate.setDate(start.getDate() + dayOffset);
+      const dayOfWeek = currentDate.getDay(); // 0 = domingo, 6 = sábado
+
+      if (dayOfWeek === 0 || dayOfWeek === 6) {
+        continue;
+      }
+
+      const dateStr = currentDate.toISOString().split('T')[0];
+
+      for (let hour = WORK_START_HOUR; hour < WORK_END_HOUR; hour++) {
+        const startTime = `${hour.toString().padStart(2, '0')}:00`;
+        const endTime = `${(hour + 1).toString().padStart(2, '0')}:00`;
+
+        // Se verifica existencia previa para no violar el unique constraint si el proceso se corre más de una vez
+        const existingSlot = await this.doctorSlotRepository.findOne({
+          where: { doctorId, date: dateStr, startTime },
+        });
+
+        if (existingSlot) {
+          continue;
+        }
+
+        const slot = this.doctorSlotRepository.create({
+          doctorId,
+          date: dateStr,
+          startTime,
+          endTime,
+        });
+
+        createdSlots.push(await this.doctorSlotRepository.save(slot));
+      }
+    }
+
+    return createdSlots;
+  }
+
+  async getAvailableSlots(
+    doctorId: string,
+    fromDate?: string,
+  ): Promise<DoctorSlot[]> {
+    await this.doctorsService.findOne(doctorId);
+
+    return this.doctorSlotRepository.find({
+      where: {
+        doctorId,
+        status: SlotStatus.AVAILABLE,
+        ...(fromDate ? { date: MoreThanOrEqual(fromDate) } : {}),
+      },
+      order: { date: 'ASC', startTime: 'ASC' },
+    });
+  }
+
+  async createAppointment(
+    patientUserId: string,
+    dto: CreateAppointmentDto,
+  ): Promise<Appointment> {
+    return this.dataSource.transaction(async (manager) => {
+      // Lock pesimista: evita que dos pacientes reserven el mismo slot en una condición de carrera
+      const slot = await manager.findOne(DoctorSlot, {
+        where: { id: dto.slotId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!slot) {
+        throw new NotFoundException('El horario solicitado no existe');
+      }
+
+      if (slot.status !== SlotStatus.AVAILABLE) {
+        throw new ConflictException('El horario ya no está disponible');
+      }
+
+      const patient = await manager.findOne(Patient, {
+        where: { userId: patientUserId },
+      });
+
+      if (!patient) {
+        throw new NotFoundException('Paciente no encontrado');
+      }
+
+      const appointment = manager.create(Appointment, {
+        doctorId: slot.doctorId,
+        patientId: patient.id,
+        slotId: slot.id,
+        status: AppointmentStatus.PENDING,
+        reason: dto.reason,
+      });
+
+      const savedAppointment = await manager.save(appointment);
+
+      slot.status = SlotStatus.BOOKED;
+      await manager.save(slot);
+
+      return savedAppointment;
+    });
+  }
+
+  async respondToAppointment(
+    doctorUserId: string,
+    appointmentId: string,
+    decision: 'confirmed' | 'rejected',
+  ): Promise<Appointment> {
+    return this.dataSource.transaction(async (manager) => {
+      const appointment = await manager.findOne(Appointment, {
+        where: { id: appointmentId },
+      });
+
+      if (!appointment) {
+        throw new NotFoundException('Cita no encontrada');
+      }
+
+      const doctor = await manager.findOne(Doctor, {
+        where: { userId: doctorUserId },
+      });
+
+      if (!doctor || doctor.id !== appointment.doctorId) {
+        throw new ForbiddenException('No tiene permisos sobre esta cita');
+      }
+
+      if (appointment.status !== AppointmentStatus.PENDING) {
+        throw new ConflictException(
+          'La cita ya fue procesada y no puede modificarse',
+        );
+      }
+
+      appointment.status =
+        decision === 'confirmed'
+          ? AppointmentStatus.CONFIRMED
+          : AppointmentStatus.REJECTED;
+
+      await manager.save(appointment);
+
+      if (decision === 'rejected') {
+        const slot = await manager.findOne(DoctorSlot, {
+          where: { id: appointment.slotId },
+        });
+
+        if (slot) {
+          slot.status = SlotStatus.AVAILABLE;
+          await manager.save(slot);
+        }
+      }
+
+      return appointment;
+    });
+  }
+
+  async rescheduleAppointment(
+    doctorUserId: string,
+    appointmentId: string,
+    newSlotId: string,
+  ): Promise<Appointment> {
+    return this.dataSource.transaction(async (manager) => {
+      const appointment = await manager.findOne(Appointment, {
+        where: { id: appointmentId },
+      });
+
+      if (!appointment) {
+        throw new NotFoundException('Cita no encontrada');
+      }
+
+      const doctor = await manager.findOne(Doctor, {
+        where: { userId: doctorUserId },
+      });
+
+      if (!doctor || doctor.id !== appointment.doctorId) {
+        throw new ForbiddenException('No tiene permisos sobre esta cita');
+      }
+
+      // Se bloquea el nuevo slot para que no pueda ser tomado por otra reserva mientras se reprograma
+      const newSlot = await manager.findOne(DoctorSlot, {
+        where: { id: newSlotId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!newSlot || newSlot.status !== SlotStatus.AVAILABLE) {
+        throw new ConflictException('El nuevo horario no está disponible');
+      }
+
+      // El slot anterior se libera dentro de la misma transacción para no dejar horarios huérfanos si algo falla
+      const oldSlot = await manager.findOne(DoctorSlot, {
+        where: { id: appointment.slotId },
+      });
+
+      if (oldSlot) {
+        oldSlot.status = SlotStatus.AVAILABLE;
+        await manager.save(oldSlot);
+      }
+
+      newSlot.status = SlotStatus.BOOKED;
+      await manager.save(newSlot);
+
+      appointment.slotId = newSlot.id;
+      await manager.save(appointment);
+
+      return appointment;
+    });
+  }
+
+  async cancelAppointment(
+    userId: string,
+    appointmentId: string,
+  ): Promise<Appointment> {
+    return this.dataSource.transaction(async (manager) => {
+      const appointment = await manager.findOne(Appointment, {
+        where: { id: appointmentId },
+      });
+
+      if (!appointment) {
+        throw new NotFoundException('Cita no encontrada');
+      }
+
+      // La cita puede cancelarla el médico o el paciente dueños de la cita, nadie más
+      const doctor = await manager.findOne(Doctor, { where: { userId } });
+      const patient = await manager.findOne(Patient, { where: { userId } });
+
+      const isOwnerDoctor = !!doctor && doctor.id === appointment.doctorId;
+      const isOwnerPatient = !!patient && patient.id === appointment.patientId;
+
+      if (!isOwnerDoctor && !isOwnerPatient) {
+        throw new ForbiddenException(
+          'No tiene permisos para cancelar esta cita',
+        );
+      }
+
+      appointment.status = AppointmentStatus.CANCELLED;
+      await manager.save(appointment);
+
+      const slot = await manager.findOne(DoctorSlot, {
+        where: { id: appointment.slotId },
+      });
+
+      if (slot) {
+        slot.status = SlotStatus.AVAILABLE;
+        await manager.save(slot);
+      }
+
+      return appointment;
+    });
+  }
+
+  async findMyAppointments(
+    userId: string,
+    role: UserRoleName,
+  ): Promise<Appointment[]> {
+    if (role === UserRoleName.DOCTOR) {
+      const doctor = await this.doctorsService.findByUserId(userId);
+
+      if (!doctor) {
+        throw new NotFoundException('Médico no encontrado');
+      }
+
+      return this.appointmentRepository.find({
+        where: { doctorId: doctor.id },
+        relations: { slot: true, patient: { user: true } },
+        order: { createdAt: 'DESC' },
+      });
+    }
+
+    const patient = await this.patientsService.findByUserId(userId);
+
+    if (!patient) {
+      throw new NotFoundException('Paciente no encontrado');
+    }
+
+    return this.appointmentRepository.find({
+      where: { patientId: patient.id },
+      relations: { slot: true, doctor: { user: true } },
+      order: { createdAt: 'DESC' },
+    });
+  }
+}
