@@ -11,6 +11,35 @@ services:
       - '${DB_PORT}:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: citasmedicas_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # .env has DB_HOST=localhost, correct only when the app runs directly
+      # on the host against Postgres's published port. Inside this compose
+      # network the app must reach Postgres by its service name instead.
+      # This overrides just that one key on top of env_file; .env itself is
+      # untouched, so `pnpm start:dev` outside Docker keeps working as-is.
+      # NODE_ENV is deliberately NOT overridden here: it stays whatever
+      # .env sets (development), so `synchronize` in database.module.ts
+      # still creates the schema on a fresh Postgres volume — there are no
+      # migrations, so forcing NODE_ENV=production here would make the app
+      # crash-loop against an empty database.
+      DB_HOST: postgres
+    ports:
+      - '${PORT}:${PORT}'
 
 volumes:
   postgres_data:

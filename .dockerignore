@@ -1,0 +1,30 @@
+# Dependencies — reinstalled fresh inside each build stage.
+node_modules
+
+# Build output — produced fresh inside the build stage.
+dist
+
+# Version control
+.git
+.gitignore
+
+# Environment files — never bake local/secret config into an image layer.
+# Real values are injected at container runtime via docker-compose
+# (env_file / environment), not copied in at build time.
+.env
+.env.*
+
+# Docs
+*.md
+
+# Test artifacts (test/ is currently empty, ignored defensively)
+test
+coverage
+
+# Editor / OS junk
+.vscode
+.idea
+.DS_Store
+*.log
+npm-debug.log*
+pnpm-debug.log*

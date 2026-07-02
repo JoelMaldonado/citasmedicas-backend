@@ -6,7 +6,6 @@ import {
 import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 import { Doctor } from './entities/doctor.entity';
 import { DataSource, Repository } from 'typeorm';
-import { UpdateDoctorDto } from './dto/update-doctor.dto';
 import { UserRoleName } from 'src/common/enums/role.enum';
 import { UserRole } from '../users/entities/user-role.entity';
 import { User } from '../users/entities/user.entity';
@@ -76,11 +75,5 @@ export class DoctorsService {
 
   async findByUserId(userId: string): Promise<Doctor | null> {
     return this.doctorRepository.findOne({ where: { userId } });
-  }
-
-  async update(id: string, updateDoctorDto: UpdateDoctorDto): Promise<Doctor> {
-    const doctor = await this.findOne(id);
-    Object.assign(doctor, updateDoctorDto);
-    return this.doctorRepository.save(doctor);
   }
 }
